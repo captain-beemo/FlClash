@@ -28,11 +28,16 @@ jobs:
 
       - name: Checkout official FlClash version
         run: |
-          git remote add upstream https://github.com/chen08209/FlClash.git || true
-          git fetch --force upstream "refs/tags/${{ inputs.source_ref }}:refs/tags/${{ inputs.source_ref }}"
-          git checkout --detach "${{ inputs.source_ref }}"
-          git submodule sync --recursive
-          git submodule update --init --recursive
+           git remote add upstream https://github.com/chen08209/FlClash.git || true
+           git fetch --force upstream "refs/tags/${{ inputs.source_ref }}:refs/tags/${{ inputs.source_ref }}"
+           git checkout --detach "${{ inputs.source_ref }}"
+
+           # Force GitHub SSH URLs to public HTTPS URLs
+           git config --global url."https://github.com/".insteadOf "git@github.com:"
+           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+
+           git submodule sync --recursive
+           git submodule update --init --recursive
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
