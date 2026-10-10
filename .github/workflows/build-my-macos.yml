@@ -2,12 +2,18 @@ name: Build and Verify FlClash macOS ARM64
 
 on:
   workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: 'Optional: re-test a candidate from a previous run; leave empty for a clean build'
+        required: false
+        default: ''
   push:
     branches: [main]
     paths: [.github/workflows/build-my-macos.yml]
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: flclash-macos-verified-${{ github.ref }}
@@ -20,8 +26,37 @@ env:
   GO_VERSION: '1.26.4'
 
 jobs:
+  plan:
+    name: Select clean build or existing candidate
+    runs-on: ubuntu-latest
+    outputs:
+      run_id: ${{ steps.select.outputs.run_id }}
+    steps:
+      - name: Select candidate
+        id: select
+        env:
+          INPUT_RUN_ID: ${{ inputs.candidate_run_id }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          run = os.environ.get('INPUT_RUN_ID', '').strip()
+          if not run and os.environ['EVENT_NAME'] == 'push':
+              match = re.search(r'\[verify-run:(\d+)\]', os.environ.get('COMMIT_MESSAGE', ''))
+              if match:
+                  run = match.group(1)
+          if run and not re.fullmatch(r'[1-9][0-9]{0,19}', run):
+              raise SystemExit('candidate_run_id must be a positive GitHub run ID')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('run_id=' + run + '\n')
+          print('Re-test candidate from run ' + run if run else 'Build fresh from pinned upstream source')
+          PY
+
   build:
     name: Clean build from upstream v0.8.99
+    needs: plan
+    if: needs.plan.outputs.run_id == ''
     runs-on: macos-26
     timeout-minutes: 90
     defaults:
@@ -166,7 +201,8 @@ jobs:
 
   verify:
     name: Verify DMG and actual Flutter startup on a fresh Mac
-    needs: build
+    needs: [plan, build]
+    if: ${{ always() && !cancelled() && needs.plan.result == 'success' && (needs.build.result == 'success' || needs.plan.outputs.run_id != '') }}
     runs-on: macos-26
     timeout-minutes: 15
     defaults:
@@ -176,8 +212,11 @@ jobs:
       - name: Download only the packaged candidate (no source or Flutter SDK)
         uses: actions/download-artifact@v4
         with:
-          name: FlClash-CANDIDATE-${{ github.run_id }}
+          name: FlClash-CANDIDATE-${{ needs.plan.outputs.run_id || github.run_id }}
           path: deliverables
+          run-id: ${{ needs.plan.outputs.run_id || github.run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
 
       - name: Mount the DMG and install in this disposable runner
         run: |
@@ -186,6 +225,13 @@ jobs:
           sw_vers | tee diagnostics/runtime-environment.txt
           uname -m | tee -a diagnostics/runtime-environment.txt
           test "$(uname -m)" = arm64
+          python3 - <<'PY'
+          import json, os
+          with open('deliverables/BUILD-INFO.json') as source:
+              info = json.load(source)
+          assert info['commit'] == os.environ['UPSTREAM_COMMIT'], 'Unexpected candidate source commit'
+          assert info['upstream'] == 'https://github.com/chen08209/FlClash'
+          PY
           hdiutil verify deliverables/FlClash-0.8.99-macos-arm64-rebuild.dmg
           hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/flclash-mount" deliverables/FlClash-0.8.99-macos-arm64-rebuild.dmg
           trap 'hdiutil detach "$RUNNER_TEMP/flclash-mount" || true' EXIT
@@ -217,7 +263,7 @@ jobs:
                   description = subprocess.check_output(['/usr/bin/file', '-b', str(path)], text=True)
                   if 'Mach-O' not in description:
                       continue
-                  subprocess.run(['/usr/bin/lipo', '-verify_arch', 'arm64', str(path)], check=True)
+                  subprocess.run(['/usr/bin/lipo', str(path), '-verify_arch', 'arm64'], check=True)
                   linked = subprocess.check_output(['/usr/bin/otool', '-L', str(path)], text=True)
                   report.write(description + linked + '\n')
                   dependencies = linked.splitlines()[1:]
@@ -363,12 +409,13 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json
+          import json, os
           from pathlib import Path
           test = json.loads(Path('diagnostics/runtime-test.json').read_text())
           assert test['success'] is True
           info = json.loads(Path('deliverables/BUILD-INFO.json').read_text())
           info['runtime_test'] = test
+          info['verification_run'] = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
           Path('deliverables/BUILD-INFO.json').write_text(json.dumps(info, indent=2) + '\n')
           Path('deliverables/READ-ME-FIRST.txt').write_text(
               'FlClash v0.8.99 ARM64 self-build\n\n'
