@@ -1,138 +1,426 @@
-name: Build My FlClash macOS Apple Silicon
+name: Build and Verify FlClash macOS ARM64
 
 on:
   workflow_dispatch:
-  # Automatically run once when this workflow file is added/updated on main.
-  # Future builds can be started from Actions > Run workflow.
   push:
-    branches:
-      - main
-    paths:
-      - .github/workflows/build-my-macos.yml
+    branches: [main]
+    paths: [.github/workflows/build-my-macos.yml]
 
 permissions:
   contents: read
 
 concurrency:
-  group: self-build-macos-arm64-${{ github.ref }}
-  cancel-in-progress: false
+  group: flclash-macos-verified-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_COMMIT: 68c71b8ef9b7486a224972eb371ff153c6b2de0f
+  RELEASE_TAG: v0.8.99
+  FLUTTER_VERSION: '3.47.4'
+  GO_VERSION: '1.26.4'
 
 jobs:
-  build-macos-arm64:
-    name: Build macOS ARM64 DMG (M1 / M2 / M3 / M4)
-    runs-on: macos-15
+  build:
+    name: Clean build from upstream v0.8.99
+    runs-on: macos-26
     timeout-minutes: 90
-
-    env:
-      FLUTTER_VERSION: "3.47.4"
-      GO_VERSION: "1.26.4"
-
+    defaults:
+      run:
+        shell: bash
     steps:
-      - name: Check out this fork
+      - name: Checkout the immutable upstream release (not the fork working tree)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          repository: chen08209/FlClash
+          ref: ${{ env.UPSTREAM_COMMIT }}
+          persist-credentials: false
+          fetch-depth: 1
 
-      - name: Get Clash.Meta submodule over HTTPS
-        shell: bash
+      - name: Prepare a clean native build
         run: |
           set -euo pipefail
-          git config --global url."https://github.com/".insteadOf "git@github.com:"
-          git submodule sync --recursive
+          mkdir -p diagnostics deliverables
+          test "$(uname -m)" = arm64
+          test "$(git rev-parse HEAD)" = "$UPSTREAM_COMMIT"
+          git config --global url."https://github.com/".insteadOf 'git@github.com:'
           git submodule update --init --recursive
-          git log -1 --format='%h %s'
-          git submodule status --recursive
+          git submodule status --recursive | tee diagnostics/submodules.txt
+          sudo xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer
+          {
+            sw_vers
+            uname -m
+            xcodebuild -version
+            xcrun --sdk macosx --show-sdk-version
+            git log -1 --format='%H %s'
+          } | tee diagnostics/build-environment.txt
 
-      - name: Verify Apple Silicon and select Xcode
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Runner architecture: $(uname -m)"
-          test "$(uname -m)" = "arm64"
-          if [ -d /Applications/Xcode_26.3.app ]; then
-            sudo xcode-select -s /Applications/Xcode_26.3.app
-          elif [ -d /Applications/Xcode_26.2.app ]; then
-            sudo xcode-select -s /Applications/Xcode_26.2.app
-          else
-            echo "Expected Xcode 26.2 or 26.3 on macos-15 image" >&2
-            exit 1
-          fi
-          xcodebuild -version
-
-      - name: Setup Go
+      - name: Setup Go (no compilation cache)
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: core/go.sum
+          cache: false
 
-      - name: Setup Rust for Apple Silicon
+      - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
 
-      - name: Setup Rust build cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: self-macos-arm64
-          workspaces: |
-            services/helper
-            plugins/rust_api/rust
-          cache-directories: .dart_tool/hooks_runner
-
-      - name: Setup Flutter
+      - name: Setup the pinned Flutter stable SDK
         uses: subosito/flutter-action@v2
         with:
-          channel: master
+          channel: stable
           flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
 
-      - name: Get Flutter dependencies
-        shell: bash
+      - name: Add an opt-in startup probe (inactive during normal use)
         run: |
           set -euo pipefail
-          flutter --version
-          go version
-          rustc --version
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('lib/main.dart')
+          text = path.read_text()
+          helper = '''void _reportStartup(String stage) {
+            final path = Platform.environment['FLCLASH_STARTUP_PROBE'];
+            if (path == null || path.isEmpty) return;
+            try {
+              File(path).writeAsStringSync('$stage\\n', mode: FileMode.append, flush: true);
+            } catch (_) {
+              // The optional diagnostic must never prevent a normal launch.
+            }
+          }
+
+          '''
+          replacements = [
+            ("void main(List<String> args) {", helper + "void main(List<String> args) {\n  _reportStartup('main-entered');"),
+            ('WidgetsFlutterBinding.ensureInitialized();', "WidgetsFlutterBinding.ensureInitialized();\n      _reportStartup('flutter-binding-ready');"),
+            ('await RustLib.init();', "await RustLib.init();\n        _reportStartup('rust-ready');"),
+            ('final version = await system.init();', "final version = await system.init();\n        _reportStartup('system-ready');"),
+            ('final container = await bootstrap.init(version);', "final container = await bootstrap.init(version);\n        _reportStartup('bootstrap-ready');"),
+            ('request.attach(container.read);', "request.attach(container.read);\n        WidgetsBinding.instance.addPostFrameCallback((_) {\n          _reportStartup('first-frame');\n        });"),
+            ('} catch (e, s) {', "} catch (e, s) {\n        _reportStartup('init-error');"),
+            ('(error, stack) {', "(error, stack) {\n      _reportStartup('async-error');"),
+          ]
+          for before, after in replacements:
+              if text.count(before) != 1:
+                  raise SystemExit(f'Unexpected upstream source: {before!r}')
+              text = text.replace(before, after, 1)
+          path.write_text(text)
+          PY
+          dart format lib/main.dart
+          git diff -- lib/main.dart > diagnostics/startup-probe.patch
+
+      - name: Resolve the committed dependency lockfile
+        run: |
+          set -euo pipefail
           flutter config --enable-macos-desktop
-          flutter pub get
+          flutter --version | tee diagnostics/flutter-version.txt
+          go version | tee diagnostics/go-version.txt
+          rustc --version | tee diagnostics/rust-version.txt
+          flutter pub get --enforce-lockfile
 
-      - name: Build macOS ARM64 DMG using the upstream release packager
-        shell: bash
+      - name: Build and package with the upstream release script
         run: |
           set -euo pipefail
-          dart setup.dart macos --env stable --targets dmg -v
+          dart setup.dart macos --env stable --targets dmg -v 2>&1 | tee diagnostics/build.log
 
-      - name: Verify architecture, DMG and SHA-256
-        shell: bash
+      - name: Stage candidate and provenance (not yet runtime verified)
         run: |
           set -euo pipefail
-          echo "Build outputs:"
-          find dist -type f -maxdepth 3 -print
+          test -s dist/FlClash-0.8.99-macos-arm64.dmg
+          cp dist/FlClash-0.8.99-macos-arm64.dmg deliverables/FlClash-0.8.99-macos-arm64-rebuild.dmg
+          cp LICENSE deliverables/LICENSE.txt
+          cp diagnostics/startup-probe.patch deliverables/startup-probe.patch
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          info = {
+            'upstream': 'https://github.com/chen08209/FlClash',
+            'tag': os.environ['RELEASE_TAG'],
+            'commit': os.environ['UPSTREAM_COMMIT'],
+            'modifications': 'Opt-in FLCLASH_STARTUP_PROBE diagnostics only; see startup-probe.patch',
+            'architecture': 'arm64',
+            'build_os': subprocess.check_output(['sw_vers', '-productVersion'], text=True).strip(),
+            'workflow_run': f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+            'signing': 'Xcode ad-hoc signing; NOT Developer ID signed or Apple notarized',
+            'runtime_test': 'pending separate job',
+          }
+          Path('deliverables/BUILD-INFO.json').write_text(json.dumps(info, indent=2) + '\n')
+          PY
 
-          app_binary="$(find build/macos/Build/Products/Release -path '*/Contents/MacOS/FlClash' -type f -print -quit)"
-          test -n "$app_binary"
-          echo "FlClash executable: $app_binary"
-          file "$app_binary"
-          lipo -archs "$app_binary" | tr ' ' '\n' | grep -qx arm64
-
-          core_binary="libclash/macos/FlClashCore"
-          test -f "$core_binary"
-          echo "FlClash core: $core_binary"
-          file "$core_binary"
-          lipo -archs "$core_binary" | tr ' ' '\n' | grep -qx arm64
-
-          dmg_count="$(find dist -type f -name '*.dmg' | wc -l | tr -d ' ')"
-          test "$dmg_count" -ge 1
-          find dist -type f -name '*.dmg' -exec shasum -a 256 {} \; | tee dist/SHA256SUMS.txt
-
-      - name: Upload installable DMG
+      - name: Upload candidate for independent verification
         uses: actions/upload-artifact@v4
         with:
-          name: FlClash-macOS-ARM64-M2-${{ github.run_number }}
-          path: |
-            dist/**/*.dmg
-            dist/*.dmg
-            dist/SHA256SUMS.txt
+          name: FlClash-CANDIDATE-${{ github.run_id }}
+          path: deliverables/
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 1
           compression-level: 0
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlClash-Build-Logs-${{ github.run_number }}
+          path: diagnostics/
+          retention-days: 7
+
+  verify:
+    name: Verify DMG and actual Flutter startup on a fresh Mac
+    needs: build
+    runs-on: macos-26
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download only the packaged candidate (no source or Flutter SDK)
+        uses: actions/download-artifact@v4
+        with:
+          name: FlClash-CANDIDATE-${{ github.run_id }}
+          path: deliverables
+
+      - name: Mount the DMG and install in this disposable runner
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics "$RUNNER_TEMP/flclash-mount" "$RUNNER_TEMP/flclash-installed"
+          sw_vers | tee diagnostics/runtime-environment.txt
+          uname -m | tee -a diagnostics/runtime-environment.txt
+          test "$(uname -m)" = arm64
+          hdiutil verify deliverables/FlClash-0.8.99-macos-arm64-rebuild.dmg
+          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/flclash-mount" deliverables/FlClash-0.8.99-macos-arm64-rebuild.dmg
+          trap 'hdiutil detach "$RUNNER_TEMP/flclash-mount" || true' EXIT
+          ditto "$RUNNER_TEMP/flclash-mount/FlClash.app" "$RUNNER_TEMP/flclash-installed/FlClash.app"
+          echo "TEST_APP=$RUNNER_TEMP/flclash-installed/FlClash.app" >> "$GITHUB_ENV"
+          echo "PROBE_DIR=$GITHUB_WORKSPACE/diagnostics" >> "$GITHUB_ENV"
+
+      - name: Validate installed bundle, signatures, ARM64 and dependencies
+        run: |
+          set -euo pipefail
+          /usr/bin/codesign --verify --deep --strict --verbose=4 "$TEST_APP" 2>&1 | tee diagnostics/signature-verify.txt
+          /usr/bin/codesign -d --verbose=4 "$TEST_APP" 2>&1 | tee diagnostics/signature-info.txt
+          python3 - <<'PY'
+          import os, plistlib, re, subprocess
+          from pathlib import Path
+          app = Path(os.environ['TEST_APP'])
+          info = plistlib.loads((app/'Contents/Info.plist').read_bytes())
+          assert info['CFBundleIdentifier'] == 'com.follow.clash'
+          assert (app/'Contents/MacOS/FlClashCore').is_file()
+          seen = set()
+          with open('diagnostics/native-dependencies.txt', 'w') as report:
+              for path in sorted(app.rglob('*')):
+                  if not path.is_file():
+                      continue
+                  path = path.resolve()
+                  if path in seen:
+                      continue
+                  seen.add(path)
+                  description = subprocess.check_output(['/usr/bin/file', '-b', str(path)], text=True)
+                  if 'Mach-O' not in description:
+                      continue
+                  subprocess.run(['/usr/bin/lipo', '-verify_arch', 'arm64', str(path)], check=True)
+                  linked = subprocess.check_output(['/usr/bin/otool', '-L', str(path)], text=True)
+                  report.write(description + linked + '\n')
+                  dependencies = linked.splitlines()[1:]
+                  assert not any(bad in line for line in dependencies for bad in ('/Users/runner/', '/opt/homebrew/', '/usr/local/')), linked
+                  commands = subprocess.check_output(['/usr/bin/otool', '-l', str(path)], text=True)
+                  for minimum in re.findall(r'\bminos\s+(\d+(?:\.\d+){0,2})', commands):
+                      version = tuple(map(int, (minimum + '.0.0').split('.')[:3]))
+                      assert version <= (26, 2, 0), (path, minimum)
+          print('Packaged native code includes ARM64 and has no build-machine library paths.')
+          PY
+
+      - name: Create the real-launch test harness
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/StartupCheck.swift" <<'SWIFT'
+          import AppKit
+          import CoreGraphics
+          import Foundation
+          import Darwin
+
+          let env = ProcessInfo.processInfo.environment
+          let appURL = URL(fileURLWithPath: env["TEST_APP"]!)
+          let output = URL(fileURLWithPath: env["PROBE_DIR"]!)
+          let stageURL = output.appendingPathComponent("startup-stages.txt")
+          var app: NSRunningApplication?
+          var launchError: String?
+          var stableSince: Date?
+          var windowID: Int?
+          let deadline = Date().addingTimeInterval(120)
+          _ = NSApplication.shared
+          NSApplication.shared.setActivationPolicy(.prohibited)
+
+          func stages() -> String {
+              return (try? String(contentsOf: stageURL, encoding: .utf8)) ?? ""
+          }
+          func savePID(_ running: NSRunningApplication) {
+              try? "\(running.processIdentifier)\n".write(to: output.appendingPathComponent("pid.txt"), atomically: true, encoding: .utf8)
+          }
+          func normalWindow(_ pid: pid_t) -> Int? {
+              let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+              for w in windows {
+                  guard (w[kCGWindowOwnerPID as String] as? Int) == Int(pid),
+                        (w[kCGWindowLayer as String] as? Int) == 0,
+                        let b = w[kCGWindowBounds as String] as? [String: Any],
+                        (b["Width"] as? Double ?? 0) >= 300,
+                        (b["Height"] as? Double ?? 0) >= 250 else { continue }
+                  return w[kCGWindowNumber as String] as? Int
+              }
+              return nil
+          }
+          func finish(_ success: Bool, _ reason: String) -> Never {
+              var report: [String: Any] = [
+                  "success": success, "reason": reason,
+                  "os": ProcessInfo.processInfo.operatingSystemVersionString,
+                  "startupStages": stages(), "visibleWindow": windowID != nil,
+                  "appleNotarized": false,
+                  "scope": "CI startup only; no VPN/TUN/network test, no browser-download Gatekeeper test, not a test on the user's Mac"
+              ]
+              if let running = app {
+                  savePID(running)
+                  report["pid"] = Int(running.processIdentifier)
+                  report["finishedLaunching"] = running.isFinishedLaunching
+                  report["terminated"] = running.isTerminated
+              }
+              if let id = windowID { report["windowID"] = id }
+              if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) {
+                  try? data.write(to: output.appendingPathComponent("runtime-test.json"))
+                  print(String(data: data, encoding: .utf8)!)
+              }
+              exit(success ? 0 : 1)
+          }
+
+          let config = NSWorkspace.OpenConfiguration()
+          config.activates = true
+          config.createsNewApplicationInstance = true
+          config.environment = [
+              "FLCLASH_STARTUP_PROBE": stageURL.path,
+              "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+              "HOME": NSHomeDirectory()
+          ]
+          NSWorkspace.shared.openApplication(at: appURL, configuration: config) { running, error in
+              DispatchQueue.main.async {
+                  app = running
+                  launchError = error?.localizedDescription
+                  if let running = running { savePID(running) }
+              }
+          }
+          while Date() < deadline {
+              RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+              if let error = launchError { finish(false, "LaunchServices: \(error)") }
+              if app == nil {
+                  app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.follow.clash").first {
+                      $0.bundleURL?.standardizedFileURL == appURL.standardizedFileURL
+                  }
+                  if let running = app { savePID(running) }
+              }
+              guard let running = app else { continue }
+              if running.isTerminated { finish(false, "Application exited during startup") }
+              let progress = stages()
+              if progress.contains("init-error") || progress.contains("async-error") {
+                  finish(false, "Application reported a startup exception")
+              }
+              windowID = normalWindow(running.processIdentifier)
+              let ready = running.isFinishedLaunching && progress.contains("first-frame") && windowID != nil
+              if ready {
+                  if stableSince == nil { stableSince = Date() }
+                  if Date().timeIntervalSince(stableSince!) >= 15 {
+                      finish(true, "Packaged app completed bootstrap, rendered its first Flutter frame and kept a visible window for 15 seconds")
+                  }
+              } else { stableSince = nil }
+          }
+          finish(false, "Timed out: did not complete Flutter bootstrap and show a window within 120 seconds")
+          SWIFT
+          xcrun swiftc -swift-version 5 -framework AppKit -framework CoreGraphics "$RUNNER_TEMP/StartupCheck.swift" -o "$RUNNER_TEMP/StartupCheck"
+
+      - name: Require successful Flutter startup and a visible window
+        id: startup
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/StartupCheck" 2>&1 | tee diagnostics/launch-check.txt
+
+      - name: Collect process diagnostics and terminate only the test app
+        if: always()
+        run: |
+          mkdir -p diagnostics
+          if [ -f diagnostics/pid.txt ]; then
+            PID="$(cat diagnostics/pid.txt)"
+            /bin/ps -p "$PID" -o pid,stat,etime,%cpu,%mem,command > diagnostics/process.txt 2>&1 || true
+            /usr/bin/sample "$PID" 3 -file diagnostics/sample.txt || true
+            /usr/bin/vmmap -summary "$PID" > diagnostics/vmmap.txt 2>&1 || true
+            if [ -f diagnostics/runtime-test.json ]; then
+              WINDOW_ID="$(python3 -c 'import json; print(json.load(open("diagnostics/runtime-test.json")).get("windowID", ""))')"
+              if [ -n "$WINDOW_ID" ]; then
+                /usr/sbin/screencapture -x -l "$WINDOW_ID" diagnostics/window.png || true
+              fi
+            fi
+            /bin/kill -TERM "$PID" 2>/dev/null || true
+          fi
+          /usr/bin/log show --last 5m --style compact --info --predicate '(process == "FlClash") OR ((process == "amfid" OR process == "syspolicyd") AND eventMessage CONTAINS[c] "FlClash")' > diagnostics/system.log 2>&1 || true
+
+      - name: Package final verified deliverables
+        if: success()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          test = json.loads(Path('diagnostics/runtime-test.json').read_text())
+          assert test['success'] is True
+          info = json.loads(Path('deliverables/BUILD-INFO.json').read_text())
+          info['runtime_test'] = test
+          Path('deliverables/BUILD-INFO.json').write_text(json.dumps(info, indent=2) + '\n')
+          Path('deliverables/READ-ME-FIRST.txt').write_text(
+              'FlClash v0.8.99 ARM64 self-build\n\n'
+              'Choose either the DMG or the app ZIP; both contain the same app.\n'
+              'Install as /Applications/FlClash.app, replacing the previous app.\n'
+              'Back up subscriptions/settings using the old app before downgrading if possible.\n'
+              'No changes to bundle ID, data directory or subscriptions are made by the build.\n'
+              'The opt-in startup probe is inactive unless FLCLASH_STARTUP_PROBE is set.\n\n'
+              'IMPORTANT: Ad-hoc signed, NOT Developer ID signed or notarized by Apple.\n'
+              'The CI startup test does NOT certify Gatekeeper acceptance after a browser download.\n'
+              'macOS 26 CI is not an exact reproduction of every macOS 26.2/M2 machine.\n'
+              'Do not disable SIP/Gatekeeper globally. Use macOS Privacy & Security approval only for trusted downloads.\n'
+              'BUILD-INFO.json records source, signing limitations, test OS and actual startup evidence.\n'
+              'SHA256SUMS.txt covers both installers. LICENSE.txt and startup-probe.patch are included.\n'
+          )
+          PY
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$TEST_APP" deliverables/FlClash-0.8.99-macos-arm64-rebuild.app.zip
+          cp diagnostics/runtime-test.json deliverables/
+          cd deliverables
+          shasum -a 256 *.dmg *.zip | tee SHA256SUMS.txt
+
+      - name: Upload runtime-verified installers
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlClash-0.8.99-macOS-ARM64-VERIFIED-${{ github.run_number }}
+          path: deliverables/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload runtime diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlClash-Runtime-Logs-${{ github.run_number }}
+          path: diagnostics/
+          retention-days: 7
+
+      - name: Write honest verification summary
+        if: always()
+        run: |
+          {
+            echo '## macOS ARM64 self-build verification'
+            echo 'Source: chen08209/FlClash v0.8.99 (68c71b8ef9b7486a224972eb371ff153c6b2de0f)'
+            echo ''
+            echo 'Final VERIFIED installers are uploaded only after Flutter bootstrap, first frame and a visible window pass on a fresh macOS runner.'
+            echo ''
+            echo '**Not Apple notarized. CI startup success is not a guarantee of Gatekeeper acceptance or startup on another Mac.**'
+            if [ -f diagnostics/runtime-test.json ]; then
+              echo '```json'
+              cat diagnostics/runtime-test.json
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
