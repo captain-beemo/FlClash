@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:fl_clash/common/common.dart';
 import 'package:fl_clash/enum/enum.dart';
+import 'package:fl_clash/icons/icons.dart';
 import 'package:fl_clash/models/models.dart';
 import 'package:fl_clash/providers/action.dart';
 import 'package:fl_clash/providers/app.dart';
@@ -80,7 +81,7 @@ class ResourcesView extends ConsumerWidget {
       body: ListView(
         padding: const EdgeInsets.symmetric(
           horizontal: 16,
-        ).copyWith(bottom: 16),
+        ).copyWith(top: context.appBarInset, bottom: 16),
         children: [
           generateSectionV3(
             title: appLocalizations.geoOptions,
@@ -189,15 +190,15 @@ class _GeoResourceListItemState extends ConsumerState<_GeoResourceListItem> {
     return file.getFileInfo();
   }
 
-  Future<void> _handleUpdateGeoDataItem() async {
-    await globalState.safeRun<void>(() async {
+  Future<void> _handleUpdateGeoDataItem() {
+    return globalState.safeRun<void>(() async {
       await ref
           .read(geoResourceActionProvider.notifier)
           .updateGeoResource(widget.type);
     }, silence: false);
-    if (!mounted) {
-      return;
-    }
+  }
+
+  void _refreshFileInfo() {
     setState(() {
       _fileInfoFuture = _getGeoFileInfo(fileName);
     });
@@ -207,14 +208,14 @@ class _GeoResourceListItemState extends ConsumerState<_GeoResourceListItem> {
     final appLocalizations = context.appLocalizations;
     return [
       CommonPopupMenuItem(
-        icon: Icons.edit_outlined,
+        glyph: AppGlyphs.edit,
         label: appLocalizations.edit,
         onPressed: () {
           _updateUrl(url);
         },
       ),
       CommonPopupMenuItem(
-        icon: Icons.sync,
+        glyph: AppGlyphs.sync,
         label: appLocalizations.sync,
         onPressed: _handleUpdateGeoDataItem,
       ),
@@ -223,7 +224,13 @@ class _GeoResourceListItemState extends ConsumerState<_GeoResourceListItem> {
 
   @override
   Widget build(BuildContext context) {
-    final isUpdating = ref.watch(isUpdatingProvider(widget.type.updatingKey));
+    final updatingKey = widget.type.updatingKey;
+    ref.listen(isUpdatingProvider(updatingKey), (previous, next) {
+      if (previous == true && !next) {
+        _refreshFileInfo();
+      }
+    });
+    final isUpdating = ref.watch(isUpdatingProvider(updatingKey));
     final url = ref.watch(
       patchClashConfigProvider.select((state) => state.geoXUrl[widget.type]),
     );
@@ -277,7 +284,7 @@ class _GeoResourceListItemState extends ConsumerState<_GeoResourceListItem> {
                               return IconButton(
                                 tooltip: context.appLocalizations.more,
                                 onPressed: open,
-                                icon: const Icon(Icons.more_vert),
+                                icon: const GlyphIcon(AppGlyphs.more),
                               );
                             },
                           ),
