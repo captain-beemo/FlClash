@@ -1,0 +1,138 @@
+name: Build My FlClash macOS Apple Silicon
+
+on:
+  workflow_dispatch:
+  # Automatically run once when this workflow file is added/updated on main.
+  # Future builds can be started from Actions > Run workflow.
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/build-my-macos.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: self-build-macos-arm64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-macos-arm64:
+    name: Build macOS ARM64 DMG (M1 / M2 / M3 / M4)
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    env:
+      FLUTTER_VERSION: "3.47.4"
+      GO_VERSION: "1.26.4"
+
+    steps:
+      - name: Check out this fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get Clash.Meta submodule over HTTPS
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule sync --recursive
+          git submodule update --init --recursive
+          git log -1 --format='%h %s'
+          git submodule status --recursive
+
+      - name: Verify Apple Silicon and select Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Runner architecture: $(uname -m)"
+          test "$(uname -m)" = "arm64"
+          if [ -d /Applications/Xcode_26.3.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.3.app
+          elif [ -d /Applications/Xcode_26.2.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.2.app
+          else
+            echo "Expected Xcode 26.2 or 26.3 on macos-15 image" >&2
+            exit 1
+          fi
+          xcodebuild -version
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: core/go.sum
+
+      - name: Setup Rust for Apple Silicon
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Setup Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: self-macos-arm64
+          workspaces: |
+            services/helper
+            plugins/rust_api/rust
+          cache-directories: .dart_tool/hooks_runner
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: master
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Get Flutter dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter --version
+          go version
+          rustc --version
+          flutter config --enable-macos-desktop
+          flutter pub get
+
+      - name: Build macOS ARM64 DMG using the upstream release packager
+        shell: bash
+        run: |
+          set -euo pipefail
+          dart setup.dart macos --env stable --targets dmg -v
+
+      - name: Verify architecture, DMG and SHA-256
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Build outputs:"
+          find dist -type f -maxdepth 3 -print
+
+          app_binary="$(find build/macos/Build/Products/Release -path '*/Contents/MacOS/FlClash' -type f -print -quit)"
+          test -n "$app_binary"
+          echo "FlClash executable: $app_binary"
+          file "$app_binary"
+          lipo -archs "$app_binary" | tr ' ' '\n' | grep -qx arm64
+
+          core_binary="libclash/macos/FlClashCore"
+          test -f "$core_binary"
+          echo "FlClash core: $core_binary"
+          file "$core_binary"
+          lipo -archs "$core_binary" | tr ' ' '\n' | grep -qx arm64
+
+          dmg_count="$(find dist -type f -name '*.dmg' | wc -l | tr -d ' ')"
+          test "$dmg_count" -ge 1
+          find dist -type f -name '*.dmg' -exec shasum -a 256 {} \; | tee dist/SHA256SUMS.txt
+
+      - name: Upload installable DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlClash-macOS-ARM64-M2-${{ github.run_number }}
+          path: |
+            dist/**/*.dmg
+            dist/*.dmg
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
